@@ -44,7 +44,7 @@ integra_serpro/      protocolo do SERPRO: envelope, mTLS, catálogo de 30
                      Testável sem rede e sem banco.
 onstage/             cola com a infraestrutura desta casa: Vault, Storage,
                      entrypoint. Só o que não precisa de rede entra em teste.
-tests/               92 testes. O SERPRO é simulado; o Postgres é real.
+tests/               100 testes. O SERPRO é simulado; o Postgres é real.
 ```
 
 A separação é o que permite mexer num lado só: quando o SERPRO mudar um
@@ -137,7 +137,7 @@ do endereço e da chave para alcançá-los:
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # 92 testes, ~4 s
+pytest                                   # 100 testes, ~4 s
 ```
 
 Os testes do worker precisam de Postgres de verdade — são SQL (`for update skip
@@ -159,6 +159,36 @@ elas aplicam limpo e são auto-consistentes.
 O stub de `eh_interno()` devolve **false** de propósito: é assim que o teste
 reproduz a condição real do worker, para quem a view do teto não existe. Um stub
 que devolvesse true esconderia o defeito.
+
+### Instalar as credenciais
+
+```bash
+python -m onstage.instalar ~/Downloads/48744243000160.pfx
+```
+
+Pede os três segredos **sem eco**, confere o certificado antes de gravar nada e
+só então escreve nos três lugares: Vault, bucket e `integra_credenciais`.
+
+Existe como comando, e não como quatro passos no painel do Supabase, por três
+razões:
+
+- **Segredo digitado no editor de SQL fica no histórico do editor.** Rodar
+  `select vault.create_secret('<a senha>', 'integra_senha_pfx')` no painel grava
+  a senha em texto puro numa lista que persiste e que qualquer pessoa com acesso
+  ao dashboard abre depois. Em `argv` é igual: entra no histórico do shell e
+  aparece em `ps`. Seria irônico vazar por descuido nosso a credencial que
+  estamos tirando de um `config.json` em texto puro.
+- **`cert_valido_ate` é lido do binário, nunca digitado.** A coluna existe para o
+  portal avisar do vencimento sem abrir o certificado; cópia digitada erra, e
+  cópia que discorda é pior que ausente — o alerta de 30/15/7 dias passa a
+  disparar no dia errado, que é o dia em que ele não serve para nada.
+- **Nada é escrito antes de o `.pfx` abrir com a senha.** Senha errada é o erro
+  mais comum deste cadastro; validando primeiro, ela não deixa um Vault com dois
+  segredos certos e um errado — estado meio-configurado que depois se diagnostica
+  lendo log.
+
+Idempotente: rodar de novo atualiza em vez de duplicar, porque o motivo mais
+provável de rodar duas vezes é ter girado o consumer secret ou a senha.
 
 ### Ensaio: a configuração está de pé?
 
