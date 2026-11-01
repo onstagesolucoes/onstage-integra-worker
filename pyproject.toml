@@ -1,0 +1,32 @@
+[project]
+name = "onstage-integra-worker"
+version = "0.1.0"
+description = "Worker do Integra Contador (SERPRO) do portal ON 360 — o único processo que carrega o e-CNPJ A1"
+# 3.12 e não 3.11: é a versão do interpretador que o fornecedor usou
+# (confirmado em python312.dll no PyInstaller), e foi com ela que a
+# decompilação do executável validou o catálogo de serviços. Ler o produto com
+# o mesmo interpretador que o gerou foi o que tornou a Fase 0 possível.
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27",
+  "cryptography>=42",
+  "signxml>=3.2",
+  "lxml>=5",
+  "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+# `pgserver` embute um PostgreSQL 17 e sobe sem container nem privilégio
+# administrativo. Não é conveniência: os testes do worker são SQL (`skip
+# locked`, upsert em índice parcial, CHECK de situação, view com `eh_interno()`)
+# e sem Postgres de verdade ficavam marcados como `skip` — 5 testes que não
+# testavam nada. Com ele, as migrações do portal são aplicadas num banco limpo
+# a cada sessão, o que também verifica as próprias migrações.
+dev = ["pytest>=8", "pgserver>=0.1.4"]
+
+[tool.setuptools]
+packages = ["integra_serpro", "integra_serpro.fila", "integra_serpro.servicos",
+            "integra_serpro.exportacao", "onstage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

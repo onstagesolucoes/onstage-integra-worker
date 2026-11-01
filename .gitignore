@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+
+# Nunca versionar certificado nem senha. O .pfx vive no bucket privado
+# `certificados-on` e as senhas no Supabase Vault — ver onstage/segredos.py.
+.env
+*.pfx
+*.p12
+*.pem
+*.key
+config.json
