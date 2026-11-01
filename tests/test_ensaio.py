@@ -180,3 +180,108 @@ def test_ensaio_percorre_todo_o_sql_contra_o_esquema_real(banco):
 def test_ensaio_recusa_cnpj_invalido_sem_tocar_na_rede(banco):
     r = _rodar_ensaio(banco, "--chamar", "123")
     assert "CNPJ inválido" in r.stdout
+
+
+# ------------------------------------------------------------------ varredura
+def test_chamar_e_varrer_sao_mutuamente_exclusivos(banco):
+    """Pedir os dois é ambíguo, e o argparse tem de recusar antes de conectar.
+
+    Importa porque a varredura faz ~97 chamadas: um comando ambíguo que o
+    programa resolve "escolhendo um" é exatamente o que ninguém quer aqui.
+    """
+    r = _rodar_ensaio(banco, "--chamar", CNPJ_ON, "--varrer")
+    assert r.returncode == 2                      # erro de uso do argparse
+    assert "not allowed with argument" in r.stderr
+
+
+def test_varredura_nao_comeca_sem_o_certificado(banco):
+    """Sem `.pfx` aberto não há o que varrer — e o passo 7 tem de dizer isso.
+
+    O teste existe porque o caminho de falha é o caminho comum enquanto os
+    segredos não estiverem no Vault, e "não verificado" é a resposta certa ali.
+    """
+    r = _rodar_ensaio(banco, "--varrer")
+    assert "Varredura da carteira pelo indicador gratuito" in r.stdout
+    assert "a varredura — o certificado não chegou a abrir" in r.stdout
+
+
+def test_sql_da_carteira_roda_contra_o_esquema_real(banco):
+    """`SQL_CARTEIRA` é escrito à mão contra `clientes` e `certificados_digitais`.
+
+    É a mesma razão dos outros testes de SQL: nome de coluna errado só aparece
+    quando roda. Aqui roda, e ainda se confirma que a varredura **não** sai de
+    `v_integra_habilitados` — se saísse, não haveria alvo nenhum para descobrir.
+    """
+    from onstage.ensaio import SQL_CARTEIRA
+
+    assert "v_integra_habilitados" not in SQL_CARTEIRA
+    with psycopg.connect(banco) as conn:
+        colunas = [d.name for d in conn.execute(SQL_CARTEIRA).description]
+    assert colunas == ["cnpj_norm", "razao_social", "ja_cadastrada"]
+
+
+def test_insert_de_procuracao_sugerido_e_aceito_pela_tabela(banco):
+    """O `insert` que a varredura imprime é para colar — então tem de colar.
+
+    Dois acidentes reais que este teste pega: `origem` só aceita 'manual' ou
+    'clickup' (`certificados_origem_chk`), e a tabela **não** tem unicidade em
+    (cnpj, tipo) — rodar duas vezes duplicaria a procuração e a view devolveria
+    o cliente duas vezes. Por isso se roda o mesmo SQL duas vezes aqui.
+    """
+    sql = """
+        insert into certificados_digitais
+              (cnpj, tipo, ativo, origem, observacoes)
+        select v.cnpj, 'procuracao_ecac', true, 'manual', 'teste'
+          from (values ('12345678000199'), ('98765432000111')) as v(cnpj)
+         where not exists (select 1 from certificados_digitais cd
+                            where cd.cnpj = v.cnpj
+                              and cd.tipo = 'procuracao_ecac')
+    """
+    with psycopg.connect(banco) as conn:
+        conn.execute(sql)
+        conn.execute(sql)                          # colado duas vezes
+        conn.commit()
+        n = conn.execute(
+            "select count(*) from certificados_digitais where tipo = 'procuracao_ecac'"
+        ).fetchone()[0]
+    assert n == 2, "o insert sugerido duplicou ao ser rodado de novo"
+
+    # E a restrição de `origem` tem de estar viva no banco de teste, senão o
+    # teste acima passaria mesmo com o 'ensaio' que produção recusa.
+    with psycopg.connect(banco) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "insert into certificados_digitais (cnpj, tipo, origem) "
+                "values ('11111111000111', 'procuracao_ecac', 'ensaio')"
+            )
+
+
+def test_motivo_da_recusa_preserva_o_texto_do_serpro():
+    """O 4xx do SERPRO vem com código e frase, e é a frase que resolve o caso.
+
+    Resumir para "deu erro" apagaria a única informação acionável: é "sem
+    procuração", "CNPJ baixado" ou "serviço indisponível para este perfil"?
+    """
+    from integra_serpro.erros import ErroSerpro
+    from onstage.ensaio import motivo_da_recusa
+
+    exc = ErroSerpro(403, [{"codigo": "Entrada-Incorreta", "texto": "Procuração não encontrada"}])
+    categoria, detalhe = motivo_da_recusa(exc)
+    assert categoria == "recusado"
+    assert "403" in detalhe
+    assert "Procuração não encontrada" in detalhe
+    assert "Entrada-Incorreta" in detalhe
+
+
+def test_erro_de_rede_nao_vira_recusa_de_procuracao():
+    """Confundir os dois faria a varredura acusar procuração que está de pé.
+
+    `recusado` é resposta sobre o cliente; `tecnico` é ruído nosso e vale
+    repetir. A saída separa as duas listas justamente para não mandar ninguém
+    ao e-CAC por causa de um timeout.
+    """
+    from onstage.ensaio import motivo_da_recusa
+
+    categoria, detalhe = motivo_da_recusa(TimeoutError("conexão expirou"))
+    assert categoria == "tecnico"
+    assert "TimeoutError" in detalhe

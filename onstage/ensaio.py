@@ -2,6 +2,7 @@
 
     python -m onstage.ensaio                   # nada de rede com o SERPRO
     python -m onstage.ensaio --chamar <cnpj>   # uma chamada, e ela é gratuita
+    python -m onstage.ensaio --varrer          # a carteira toda, e também de graça
 
 Por que isto existe como comando separado do worker: entre "configurei os
 segredos" e "o SERPRO respondeu" há seis coisas que podem estar erradas, e
@@ -25,6 +26,20 @@ R$ 0,00 — enquanto a mesma pergunta feita pelo SITFIS custaria R$ 0,32 para
 receber o mesmo "não". Logo o indicador é a sonda certa para as duas dúvidas de
 uma vez: "a nossa autenticação funciona?" e "a procuração deste cliente está de
 pé?".
+
+E se a recusa é gratuita, perguntar por **todos** também é. É o que `--varrer`
+faz: passa a carteira ativa inteira pelo indicador e separa quem respondeu de
+quem foi recusado. Isso responde "quais empresas estão no trilho do Integra
+Contador?" pela única fonte que decide a questão — a Receita — em vez de inferir
+de uma configuração nossa em outro sistema. Configuração diz o que alguém quis;
+a resposta do SERPRO diz o que vale hoje. Custo da varredura: R$ 0,00, e o
+ensaio soma os custos registrados no fim para provar isso em vez de prometer.
+
+Efeito colateral útil: a saída do `--varrer` é exatamente a lista de
+`procuracao_ecac` que falta em `certificados_digitais` (hoje a tabela tem 94
+linhas e **todas** são A1, nenhuma procuração), então ela serve de base para o
+cadastro. O ensaio imprime o `insert` e não o executa: registrar procuração é
+ato de cadastro, e cadastro tem dono.
 """
 from __future__ import annotations
 
@@ -111,14 +126,245 @@ def cnpj_do_certificado(titular: str) -> str | None:
     return achados[0] if len(achados) == 1 else None
 
 
+def motivo_da_recusa(exc: Exception) -> tuple[str, str]:
+    """Traduz a exceção de uma chamada do indicador em (categoria, detalhe).
+
+    A categoria importa porque muda o que fazer. `recusado` é resposta sobre
+    **aquele** cliente — a procuração não está de pé, e seguir para o próximo é
+    o certo. `tecnico` é ruído de rede, que pode acertar só uma linha. Já
+    `FalhaAutenticacao` não é sobre cliente nenhum: é a nossa credencial, e
+    quem recebe isso na primeira chamada receberia nas 96 seguintes. Por isso
+    ela não aparece aqui — a varredura a trata como fatal e para.
+
+    O `texto` que o SERPRO manda junto do 4xx é o que distingue "sem procuração"
+    de "CNPJ baixado" de "serviço indisponível para este perfil". Guardo-o
+    inteiro em vez de resumir para "deu erro": é a frase que a pessoa vai levar
+    para o e-CAC conferir.
+    """
+    from integra_serpro.erros import ErroSerpro
+
+    if isinstance(exc, ErroSerpro):
+        codigos = "; ".join(
+            f"{m.get('codigo', '')} {m.get('texto', '')}".strip()
+            for m in exc.mensagens
+        ).strip()
+        return "recusado", f"HTTP {exc.status_http}" + (f" — {codigos}" if codigos else "")
+    return "tecnico", f"{type(exc).__name__}: {exc}"
+
+
+SQL_CARTEIRA = """
+select c.cnpj_norm,
+       c.razao_social,
+       exists (select 1 from certificados_digitais cd
+                where cd.cnpj = c.cnpj_norm
+                  and cd.tipo = 'procuracao_ecac'
+                  and cd.ativo) as ja_cadastrada
+  from clientes c
+ where c.ativo
+   and length(regexp_replace(c.cnpj_norm, '\\D', '', 'g')) = 14
+ order by c.razao_social
+"""
+
+
+def varrer(conn, cnpj_tab: str, nome: str, pfx: bytes, senha: str,
+           segredos: dict, pausa: float) -> None:
+    """Pergunta ao SERPRO, por toda a carteira ativa, quem está no trilho.
+
+    A lista de alvos vem de `clientes`, **não** de `v_integra_habilitados`:
+    aquela view exige a linha de procuração em `certificados_digitais`, que é
+    justamente o que esta varredura existe para descobrir. Ler a view aqui daria
+    zero alvos e a conclusão falsa de que ninguém tem procuração.
+
+    O CNPJ da própria ON é tratado à parte porque responde por outro motivo: o
+    contratante consulta a si mesmo direto pelo e-CNPJ, sem procuração no meio.
+    Um "ok" ali prova o encanamento; um "ok" num cliente prova a procuração.
+    Misturar os dois na mesma contagem faria a varredura parecer um sucesso
+    parcial quando o que funcionou foi só a autenticação.
+    """
+    import time
+
+    from integra_serpro.catalogo import SERVICOS
+    from integra_serpro.client import SerproClient
+    from integra_serpro.erros import AindaProcessando, FalhaAutenticacao
+    from integra_serpro.preco import custo
+    from integra_serpro.servicos.caixa_postal import CaixaPostal
+    from integra_serpro import Credenciais
+
+    alvos = conn.execute(SQL_CARTEIRA).fetchall()
+    if not alvos:
+        falha("nenhum cliente ativo com CNPJ de 14 dígitos em `clientes`")
+        return
+
+    contratante = so_digitos(cnpj_tab)
+    esperado = custo(SERVICOS["caixa_indicador"])
+    print(f"         {len(alvos)} cliente(s) ativo(s) na carteira")
+    print(f"         custo previsto por chamada: R$ {esperado} — "
+          f"total previsto: R$ {esperado * len(alvos)}")
+    if esperado != 0:
+        falha(
+            f"ABORTADO: o indicador deveria ser gratuito e o catálogo diz R$ {esperado}. "
+            "Varrer 90+ clientes a esse preço não é teste, é conta. "
+            "Confira `GRATUITOS` em integra_serpro/preco.py antes de insistir."
+        )
+        return
+    print(f"         pausa entre chamadas: {pausa:g}s\n")
+
+    # Os registros ficam em memória de propósito. `integra_chamadas` é o livro
+    # de **gasto** do worker; lançar ali 97 chamadas de R$ 0,00 feitas à mão por
+    # uma pessoa no terminal suja a série que o painel de custos usa. O que a
+    # varredura precisa provar sobre dinheiro ela prova somando o que registrou.
+    registros: list = []
+    try:
+        cred = Credenciais(
+            contratante_cnpj=contratante,
+            nome_escritorio=nome,
+            pfx=pfx,
+            senha_pfx=senha,
+            consumer_key=segredos.get("consumer key") or "",
+            consumer_secret=segredos.get("consumer secret") or "",
+        )
+        cliente = SerproClient(cred, registrar=registros.append)
+        caixa = CaixaPostal(cliente)
+    except Exception as exc:
+        falha(f"não consegui montar o cliente do SERPRO: {type(exc).__name__}: {exc}")
+        return
+
+    de_pe: list[tuple[str, str, int, bool]] = []
+    recusados: list[tuple[str, str, str]] = []
+    tecnicos: list[tuple[str, str, str]] = []
+    interrompida = ""
+
+    for i, (cnpj, razao, ja_cadastrada) in enumerate(alvos, 1):
+        alvo = so_digitos(cnpj)
+        rotulo = f"[{i:>3}/{len(alvos)}] {alvo}  {(razao or '')[:38]:<38}"
+        try:
+            novas = caixa.indicador_novas(alvo)
+        except AindaProcessando:
+            # 204 no indicador: autorizado, sem nada a relatar. Para a pergunta
+            # desta varredura — "a procuração está de pé?" — é um sim.
+            de_pe.append((alvo, razao, 0, ja_cadastrada))
+            print(f"{rotulo} ok (sem mensagens)")
+        except FalhaAutenticacao as exc:
+            # Não é sobre este cliente: é a nossa credencial. Seguir faria 96
+            # chamadas para colecionar a mesma frase.
+            interrompida = f"{type(exc).__name__}: {exc}"
+            print(f"{rotulo} FALHA DE AUTENTICAÇÃO")
+            break
+        except Exception as exc:
+            categoria, detalhe = motivo_da_recusa(exc)
+            (recusados if categoria == "recusado" else tecnicos).append(
+                (alvo, razao, detalhe)
+            )
+            print(f"{rotulo} {'recusado' if categoria == 'recusado' else 'erro'}: {detalhe[:60]}")
+        else:
+            de_pe.append((alvo, razao, novas, ja_cadastrada))
+            print(f"{rotulo} ok — {novas} mensagem(ns) nova(s)")
+        if i < len(alvos) and pausa > 0:
+            time.sleep(pausa)
+
+    # ------------------------------------------------------------------ leitura
+    print()
+    if interrompida:
+        falha(
+            f"varredura interrompida na {len(de_pe) + len(recusados) + len(tecnicos) + 1}ª "
+            f"chamada: {interrompida}. "
+            "Isto é credencial nossa, não procuração de cliente — o resultado parcial "
+            "acima não diz nada sobre quem está ou não no trilho."
+        )
+    gasto = sum(r.custo_estimado or 0 for r in registros)
+    print(f"         {len(registros)} chamada(s) registrada(s), custo somado: R$ {gasto}")
+    if gasto != 0:
+        falha(f"a varredura custou R$ {gasto} — era para ser gratuita. Investigue antes de repetir.")
+
+    proprio = [t for t in de_pe if t[0] == contratante]
+    clientes_ok = [t for t in de_pe if t[0] != contratante]
+    if proprio:
+        ok(f"a própria ON respondeu ({contratante}) — encanamento de pé: "
+           "consumer key/secret, mTLS e envelope. Sem procuração no meio.")
+
+    if clientes_ok:
+        ok(f"{len(clientes_ok)} cliente(s) com procuração e-CAC de pé hoje:")
+        for cnpj, razao, novas, ja in clientes_ok:
+            marca = "" if ja else "   ← falta cadastrar em certificados_digitais"
+            print(f"           {cnpj}  {razao}  ({novas} msg){marca}")
+    elif not interrompida:
+        aviso(
+            "nenhum cliente respondeu. Se o CNPJ da ON respondeu e os clientes não, "
+            "a autenticação está certa e o que falta são as procurações no e-CAC — "
+            "o que é um trabalho de cadastro na Receita, não de código."
+        )
+
+    if recusados:
+        aviso(f"{len(recusados)} recusado(s) pelo SERPRO — leia o motivo de cada um:")
+        for cnpj, razao, detalhe in recusados:
+            print(f"           {cnpj}  {(razao or '')[:34]:<34} {detalhe}")
+    if tecnicos:
+        aviso(f"{len(tecnicos)} com erro técnico (vale repetir só estes):")
+        for cnpj, razao, detalhe in tecnicos:
+            print(f"           {cnpj}  {(razao or '')[:34]:<34} {detalhe}")
+
+    # -------------------------------------------------- o cadastro que falta
+    faltam = [(c, r) for c, r, _, ja in clientes_ok if not ja]
+    if faltam:
+        print(
+            f"\n         {len(faltam)} cliente(s) respondem no e-CAC mas não têm a linha de\n"
+            "         procuração no portal — e sem ela `v_integra_habilitados` não os\n"
+            "         devolve, logo o agendamento não os enfileira. Para cadastrar:\n"
+        )
+        valores = ",\n                      ".join(f"('{c}')" for c, _ in faltam)
+        # `origem` aceita só 'manual' ou 'clickup' (certificados_origem_chk), e
+        # 'manual' é o rótulo honesto: o ensaio não é via de ingestão, é uma
+        # pessoa decidindo depois de ler a saída. A procedência fica em
+        # `observacoes`, que é texto livre.
+        #
+        # O `where not exists` existe porque a tabela não tem unicidade em
+        # (cnpj, tipo): este é SQL para colar, e SQL para colar é colado duas
+        # vezes. Sem a guarda, a segunda vez dá duas procurações para o mesmo
+        # cliente e a view passa a devolvê-lo em duplicata.
+        print(
+            "           insert into certificados_digitais\n"
+            "                 (cnpj, tipo, ativo, origem, observacoes)\n"
+            "           select v.cnpj, 'procuracao_ecac', true, 'manual',\n"
+            f"                  'procuração confirmada no e-CAC pela varredura de "
+            f"{date.today():%d/%m/%Y}'\n"
+            f"             from (values\n                      {valores}\n"
+            "                  ) as v(cnpj)\n"
+            "            where not exists (select 1 from certificados_digitais cd\n"
+            "                               where cd.cnpj = v.cnpj\n"
+            "                                 and cd.tipo = 'procuracao_ecac');\n"
+        )
+        print(
+            "         `data_vencimento` fica nula porque /Monitorar não devolve o prazo\n"
+            "         da procuração, e inventar data seria pior que não ter: o alerta de\n"
+            "         30 dias passaria a disparar na data errada. Nulo a view aceita, e\n"
+            "         quem vigia o vencimento na prática é esta mesma chamada gratuita,\n"
+            "         que passa a recusar no dia em que a procuração morrer."
+        )
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Verifica a configuração do Integra Contador sem gastar chamada paga."
     )
-    p.add_argument(
+    alvo_grupo = p.add_mutually_exclusive_group()
+    alvo_grupo.add_argument(
         "--chamar",
         metavar="CNPJ",
         help="faz UMA chamada ao SERPRO: o indicador da caixa postal, que é gratuito.",
+    )
+    alvo_grupo.add_argument(
+        "--varrer",
+        action="store_true",
+        help="passa a carteira ativa inteira pelo indicador gratuito e diz quem "
+             "tem procuração e-CAC de pé. Também custa R$ 0,00.",
+    )
+    p.add_argument(
+        "--pausa",
+        type=float,
+        default=1.0,
+        metavar="SEG",
+        help="espera entre as chamadas da varredura (padrão: 1,0 s). É educação "
+             "com a Receita, não exigência nossa.",
     )
     args = p.parse_args()
 
@@ -333,9 +579,16 @@ def main() -> int:
             print(f"         {c}  {razao}")
 
     # -------------------------------------------------------- a chamada gratuita
-    if not args.chamar:
+    if not args.chamar and not args.varrer:
         titulo("7. Chamada ao SERPRO")
-        pulo("nenhuma chamada feita — use --chamar <cnpj> para o indicador gratuito")
+        pulo("nenhuma chamada feita — use --chamar <cnpj> para o indicador gratuito, "
+             "ou --varrer para a carteira toda")
+    elif args.varrer:
+        titulo("7. Varredura da carteira pelo indicador gratuito")
+        if info is None or not pfx:
+            pulo("a varredura — o certificado não chegou a abrir")
+        else:
+            varrer(conn, cnpj_tab, nome, pfx, senha or "", segredos, args.pausa)
     else:
         alvo = so_digitos(args.chamar)
         titulo(f"7. Indicador da caixa postal para {alvo} (gratuito)")

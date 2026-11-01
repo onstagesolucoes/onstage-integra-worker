@@ -54,13 +54,27 @@ create table if not exists public.clientes (
 -- A tabela que decide quem pode ser consultado. Atenção ao nome da coluna: aqui
 -- é `cnpj` (é a view `v_certificado_cliente` que expõe `cnpj_norm`) — trocar os
 -- dois faz a `v_integra_habilitados` devolver zero linha sem erro nenhum.
+--
+-- `origem` e `observacoes` estão aqui porque a varredura do ensaio imprime um
+-- `insert` nessas colunas para a pessoa colar. O `check` de `origem` é o de
+-- produção, copiado: ele aceita só 'manual' e 'clickup', e um `insert` sugerido
+-- com 'ensaio' seria recusado **no banco dela**, depois de colado. Sem a
+-- restrição aqui, o teste aprovaria o SQL quebrado.
+--
+-- Os `default` também são os de produção, e não enfeite: é deles que depende o
+-- `insert` sugerido poder omitir `criado_em`/`atualizado_em`, que são `not null`.
 create table if not exists public.certificados_digitais (
   id              bigserial primary key,
   cnpj            text not null,
   tipo            text check (tipo in ('A1','A3','procuracao_ecac','nao_possui')),
   arquivo_path    text,
   data_vencimento date,
-  ativo           boolean not null default true
+  origem          text not null default 'manual'
+                    check (origem in ('manual','clickup')),
+  observacoes     text,
+  ativo           boolean not null default true,
+  criado_em       timestamptz not null default now(),
+  atualizado_em   timestamptz not null default now()
 );
 
 /* ─────────────────────── parcelamentos_fiscais ─────────────────────── */

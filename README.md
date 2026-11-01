@@ -44,7 +44,7 @@ integra_serpro/      protocolo do SERPRO: envelope, mTLS, catálogo de 30
                      Testável sem rede e sem banco.
 onstage/             cola com a infraestrutura desta casa: Vault, Storage,
                      entrypoint. Só o que não precisa de rede entra em teste.
-tests/               86 testes. O SERPRO é simulado; o Postgres é real.
+tests/               92 testes. O SERPRO é simulado; o Postgres é real.
 ```
 
 A separação é o que permite mexer num lado só: quando o SERPRO mudar um
@@ -137,7 +137,7 @@ do endereço e da chave para alcançá-los:
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # 86 testes, ~4 s
+pytest                                   # 92 testes, ~4 s
 ```
 
 Os testes do worker precisam de Postgres de verdade — são SQL (`for update skip
@@ -165,6 +165,7 @@ que devolvesse true esconderia o defeito.
 ```bash
 python -m onstage.ensaio                   # nada de rede com o SERPRO
 python -m onstage.ensaio --chamar <cnpj>   # uma chamada, e ela é gratuita
+python -m onstage.ensaio --varrer          # a carteira toda, e também de graça
 ```
 
 `pytest` prova o código; o ensaio prova **esta instalação**. Entre "cadastrei os
@@ -198,6 +199,47 @@ Por isso a ordem do primeiro teste em produção é: ensaio sem rede → ensaio 
 `--chamar` no CNPJ da própria ON (que não depende de procuração de ninguém) →
 ensaio com `--chamar` num cliente. O terceiro passo é o que prova a procuração,
 e os três somados custam R$ 0,00.
+
+### `--varrer`: quem está no trilho, perguntado à Receita
+
+Se a recusa é gratuita, perguntar por **todos** também é. `--varrer` passa a
+carteira ativa inteira pelo indicador e separa quem respondeu de quem foi
+recusado — com o código e a frase que o SERPRO mandou, porque é a frase que
+distingue "sem procuração" de "CNPJ baixado" de "serviço indisponível para este
+perfil", e é ela que a pessoa leva para o e-CAC conferir.
+
+Isso responde "quais empresas estão no trilho do Integra Contador?" pela única
+fonte que decide a questão. Dá para inferir de configuração nossa em outro
+sistema, mas configuração diz o que alguém quis em algum momento; a resposta do
+SERPRO diz o que vale hoje. São coisas diferentes, e a segunda é a que o worker
+vai encontrar quando rodar.
+
+Três decisões que importam:
+
+- **Os alvos saem de `clientes`, não de `v_integra_habilitados`.** A view exige a
+  linha de procuração em `certificados_digitais` — que é justamente o que a
+  varredura existe para descobrir. Ler a view daria zero alvos e a conclusão
+  falsa de que ninguém tem procuração.
+- **O CNPJ da própria ON conta separado.** O contratante consulta a si mesmo
+  direto pelo e-CNPJ, sem procuração no meio: um "ok" ali prova o encanamento,
+  um "ok" num cliente prova a procuração. Somados, fariam a varredura parecer
+  sucesso parcial quando o que funcionou foi só a autenticação.
+- **`FalhaAutenticacao` interrompe.** Não é resposta sobre cliente nenhum, é a
+  nossa credencial — quem recebe isso na primeira chamada receberia nas 96
+  seguintes. O resultado parcial é marcado como não conclusivo.
+
+O ensaio **soma os custos registrados no fim** em vez de prometer que foi de
+graça, e aborta antes de começar se o catálogo disser que o indicador custa algo:
+varrer 90+ clientes a R$ 0,24 não é teste, é conta.
+
+Efeito colateral útil: a saída é exatamente a lista de `procuracao_ecac` que
+falta em `certificados_digitais` — hoje a tabela tem 94 linhas e **todas** são
+A1, nenhuma procuração, o que é o motivo de `v_integra_habilitados` voltar vazia.
+O ensaio imprime o `insert` e **não** o executa: registrar procuração é ato de
+cadastro, e cadastro tem dono. `data_vencimento` sai nula porque `/Monitorar` não
+devolve o prazo, e inventar data seria pior que não ter — o alerta de 30 dias
+passaria a disparar no dia errado. Quem vigia o vencimento na prática é essa
+mesma chamada gratuita, que passa a recusar no dia em que a procuração morrer.
 
 ### Em produção
 
