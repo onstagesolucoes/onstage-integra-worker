@@ -44,14 +44,14 @@ integra_serpro/      protocolo do SERPRO: envelope, mTLS, catálogo de 30
                      Testável sem rede e sem banco.
 onstage/             cola com a infraestrutura desta casa: Vault, Storage,
                      entrypoint. Só o que não precisa de rede entra em teste.
-tests/               69 testes. O SERPRO é simulado; o Postgres é real.
+tests/               86 testes. O SERPRO é simulado; o Postgres é real.
 ```
 
 A separação é o que permite mexer num lado só: quando o SERPRO mudar um
 envelope, muda `integra_serpro`; quando trocarmos de cofre, muda `onstage`.
 
 **O SQL não vive aqui.** As tabelas são do portal e as migrações estão em
-`portal-360/supabase/migrations/20261101001600..001900`. Duas fontes de verdade
+`portal-360/supabase/migrations/20261101001600..002000`. Duas fontes de verdade
 para o mesmo esquema é como se chega a um `insert` que funciona no teste e
 quebra em produção.
 
@@ -137,7 +137,7 @@ do endereço e da chave para alcançá-los:
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # 69 testes, ~2 s
+pytest                                   # 86 testes, ~4 s
 ```
 
 Os testes do worker precisam de Postgres de verdade — são SQL (`for update skip
@@ -159,6 +159,45 @@ elas aplicam limpo e são auto-consistentes.
 O stub de `eh_interno()` devolve **false** de propósito: é assim que o teste
 reproduz a condição real do worker, para quem a view do teto não existe. Um stub
 que devolvesse true esconderia o defeito.
+
+### Ensaio: a configuração está de pé?
+
+```bash
+python -m onstage.ensaio                   # nada de rede com o SERPRO
+python -m onstage.ensaio --chamar <cnpj>   # uma chamada, e ela é gratuita
+```
+
+`pytest` prova o código; o ensaio prova **esta instalação**. Entre "cadastrei os
+segredos" e "o SERPRO respondeu" há seis coisas que podem estar erradas, e
+descobrir qual no meio de um job significa ler log de container para achar uma
+senha com espaço no fim. Pior: o worker, ao falhar, **tenta de novo** — e nos
+endpoints pagos cada tentativa é cobrada, inclusive as que voltam 4xx.
+
+Sete passos, na ordem em que `ProviderSupabase` os percorre: variáveis de
+ambiente, `integra_credenciais`, os três segredos no Vault, o `.pfx` no bucket,
+abrir o `.pfx` com a senha, `v_integra_habilitados` e — só com `--chamar` — o
+SERPRO. Nenhum segredo é impresso: de cada um sai se existe e o tamanho, o
+suficiente para separar "não cadastrei" de "cadastrei vazio" de "cadastrei com
+um espaço no fim", que são os três erros reais.
+
+Dois detalhes que são o ponto do comando, não implementação:
+
+- **A conexão é `autocommit`.** O ensaio só lê, e tem de continuar lendo depois
+  de um `select` falhar: numa transação o primeiro erro aborta o bloco e tudo
+  depois volta `InFailedSqlTransaction` — o diagnóstico pararia de diagnosticar
+  exatamente quando há o que diagnosticar.
+- **O `--chamar` aponta para `INNOVAMSG63`**, o indicador da caixa postal, que
+  vai para `/Monitorar` — o único endpoint que o SERPRO não cobra. Isso dá uma
+  propriedade que vale mais do que parece: **até a recusa é de graça.** Se a
+  procuração e-CAC daquele cliente não estiver valendo, a resposta é 4xx e custa
+  R$ 0,00, enquanto a mesma pergunta feita pelo SITFIS custaria R$ 0,32 para
+  receber o mesmo "não". É a sonda certa para as duas dúvidas de uma vez: "a
+  nossa autenticação funciona?" e "a procuração deste cliente está de pé?".
+
+Por isso a ordem do primeiro teste em produção é: ensaio sem rede → ensaio com
+`--chamar` no CNPJ da própria ON (que não depende de procuração de ninguém) →
+ensaio com `--chamar` num cliente. O terceiro passo é o que prova a procuração,
+e os três somados custam R$ 0,00.
 
 ### Em produção
 
